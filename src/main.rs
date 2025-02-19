@@ -1,20 +1,16 @@
-use chrono::{DateTime, Datelike, Locale, Utc};
-use chrono::{Duration, Local};
-use serde::{Deserialize, Serialize};
-use serde_json;
-use std::fs;
-use std::io;
-use teloxide::{prelude::*, utils::command::BotCommands};
+use chrono::{Datelike, Duration, Local, Locale, NaiveDateTime};
+use dptree::case;
+use teloxide::{
+    dispatching::dialogue::{self, InMemStorage},
+    prelude::*,
+    utils::command::BotCommands,
+};
+mod schedule;
+mod state;
+use state::State;
+mod utils;
 
-#[tokio::main]
-async fn main() {
-    pretty_env_logger::init();
-    log::info!("Starting bot...");
-
-    let bot = Bot::from_env();
-
-    Command::repl(bot, proccess_commands).await;
-}
+type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Эти команды доступны:")]
@@ -35,81 +31,226 @@ enum Command {
     Nweek,
     #[command(description = "Удалить пару")]
     Delete,
+    #[command(description = "Отмена")]
+    Cancel,
 }
 
-async fn proccess_commands(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
-    match cmd {
-        Command::Help | Command::Start => default(bot, msg).await?,
-        Command::Day | Command::Tomorrow | Command::Nweek | Command::Week => {
-            get_schedule(bot, msg, cmd).await?
-        }
-        Command::Add => todo!(),
-        Command::Delete => todo!(),
-    }
+#[tokio::main]
+async fn main() {
+    pretty_env_logger::init();
 
-    Ok(())
+    let bot = Bot::from_env();
+
+    let command_handler = teloxide::filter_command::<Command, _>()
+        .branch(case![Command::Add].endpoint(add_lesson_handler))
+        .branch(case![Command::Delete].endpoint(delete_lesson_handler))
+        .branch(case![Command::Start].endpoint(default))
+        .branch(case![Command::Help].endpoint(default))
+        .branch(case![Command::Cancel].endpoint(cancel))
+        .branch(dptree::endpoint(get_schedule));
+
+    let message_handler = Update::filter_message()
+        .branch(command_handler)
+        .branch(
+            case![State::AddLesson {
+                name,
+                time,
+                duration,
+                lesson_type,
+                cabinet
+            }]
+            .endpoint(manage_lessons_handler),
+        )
+        .branch(
+            case![State::DeleteLesson {
+                name,
+                time,
+                duration,
+                lesson_type,
+                cabinet
+            }]
+            .endpoint(manage_lessons_handler),
+        )
+        .branch(dptree::endpoint(default));
+
+    Dispatcher::builder(
+        bot,
+        dialogue::enter::<Update, InMemStorage<State>, State, _>().branch(message_handler),
+    )
+    .dependencies(dptree::deps![InMemStorage::<State>::new()])
+    .enable_ctrlc_handler()
+    .build()
+    .dispatch()
+    .await;
 }
 
-async fn default(bot: Bot, msg: Message) -> ResponseResult<()> {
+async fn default(bot: Bot, msg: Message) -> HandlerResult {
     bot.send_message(
         msg.chat.id,
         "Привет! Я бот, который показывает расписание. \n
-        Доступные команды: \n
-        /day - расписание на сегодня \n
-        /tomorrow - расписание на завтра \n
-        /week - расписание на эту неделю \n
-        /nweek - расписание на следующую неделю \n
-        /add - добавить занятие в расписание \n
-        /delete - удалить добавленное занятие",
+<b>Доступные команды:</b> \n
+/day - расписание на сегодня \n
+/tomorrow - расписание на завтра \n
+/week - расписание на эту неделю \n
+/nweek - расписание на следующую неделю \n
+/add - добавить занятие в расписание \n
+/delete - удалить добавленное занятие",
     )
     .await?;
     Ok(())
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-struct Lesson {
-    name: String,
-    #[serde(rename = "type")]
-    lesson_type: String,
-    duration: i64,
-    cabinet: String,
-    #[serde(with = "serialze_datetime")]
-    date: DateTime<Utc>,
+async fn cancel(
+    bot: Bot,
+    msg: Message,
+    dialogue: Dialogue<State, InMemStorage<State>>,
+) -> HandlerResult {
+    dialogue.update(State::Default).await?;
+    bot.send_message(msg.chat.id, "Команда сброшена").await?;
+    Ok(())
 }
 
-mod serialze_datetime {
-    use chrono::{DateTime, NaiveDateTime, Utc};
-    use serde::{self, Deserialize, Deserializer, Serializer};
+async fn manage_lessons_handler(
+    bot: Bot,
+    msg: Message,
+    dialogue: Dialogue<State, InMemStorage<State>>,
+    mut state: State,
+) -> HandlerResult {
+    let Some(text) = msg.text() else {
+        bot.send_message(msg.chat.id, "Сообщение не содержит текст")
+            .await?;
+        return Ok(());
+    };
+    let (name, time, duration, lesson_type, cabinet, add) = match &mut state {
+        State::AddLesson {
+            name,
+            time,
+            duration,
+            lesson_type,
+            cabinet,
+        } => (name, time, duration, lesson_type, cabinet, true),
+        State::DeleteLesson {
+            name,
+            time,
+            duration,
+            lesson_type,
+            cabinet,
+        } => (name, time, duration, lesson_type, cabinet, false),
+        _ => {
+            bot.send_message(msg.chat.id, "Произошла ошибка, попробуйте ещё раз.")
+                .await?;
+            return Ok(());
+        }
+    };
 
-    const FORMAT: &'static str = "%d-%m-%Y %H:%M";
+    let next_step: &str;
 
-    pub fn serialize<S>(date: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let s = format!("{}", date.format(FORMAT));
-        serializer.serialize_str(&s)
+    if name.is_none() {
+        *name = Some(text.to_string());
+        next_step = "Введите время в формате <b>19.02.2025 10:25</b>.";
+    } else if time.is_none() {
+        let parsed_time = match NaiveDateTime::parse_from_str(text.trim(), "%d.%m.%Y %H:%M") {
+            Ok(time) => time,
+            Err(_) => {
+                bot.send_message(
+                    msg.chat.id,
+                    "Введена дата в неподходящем формате. Введите время в формате: <b>19.02.2025 10:25</b>."
+                ).parse_mode(teloxide::types::ParseMode::Html).await?;
+                return Ok(());
+            }
+        };
+        *time = Some(parsed_time.and_utc());
+        next_step = "Введите продолжительность в формате: <b>80</b>.";
+    } else if duration.is_none() {
+        let parsed_duration = match text.trim().parse::<i64>() {
+            Ok(time) => time,
+            Err(_) => {
+                bot.send_message(
+                    msg.chat.id,
+                    "Введена некорректная продолжительность. Введите продолжительность в формате: <b>80</b>."
+                ).parse_mode(teloxide::types::ParseMode::Html).await?;
+                return Ok(());
+            }
+        };
+        *duration = Some(parsed_duration);
+        next_step = "Введите тип занятия (лекция/семинар/etc).";
+    } else if lesson_type.is_none() {
+        *lesson_type = Some(text.to_string());
+        next_step = "Введите место проведения занятия.";
+    } else if cabinet.is_none() {
+        *cabinet = Some(text.to_string());
+        next_step = "Готово. Введите что угодно, или нажмите /cancel.";
+    } else {
+        let lesson = schedule::Lesson {
+            name: name.take().unwrap(),
+            lesson_type: lesson_type.take().unwrap(),
+            duration: duration.take().unwrap(),
+            cabinet: cabinet.take().unwrap(),
+            date: time.take().unwrap(),
+        };
+        if add {
+            schedule::add(lesson)?;
+            next_step = "Занятие добавлено.";
+        } else {
+            schedule::delete(&lesson)?;
+            next_step = "Занятие удалено.";
+        }
+        state = State::Default;
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let dt = NaiveDateTime::parse_from_str(&s, FORMAT).map_err(serde::de::Error::custom)?;
-        Ok(DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
-    }
+    bot.send_message(
+        msg.chat.id,
+        format!("{}\n\n{}", utils::state_message(state.clone()), next_step),
+    )
+    .parse_mode(teloxide::types::ParseMode::Html)
+    .await?;
+    dialogue.update(state).await?;
+    Ok(())
 }
 
-fn load_schedule() -> io::Result<Vec<Lesson>> {
-    let data = fs::read_to_string("schedule.json")?;
-    let lessons: Vec<Lesson> = serde_json::from_str(&data).unwrap();
-    Ok(lessons)
+async fn add_lesson_handler(
+    bot: Bot,
+    msg: Message,
+    dialogue: Dialogue<State, InMemStorage<State>>,
+) -> HandlerResult {
+    dialogue
+        .update(State::AddLesson {
+            name: None,
+            time: None,
+            duration: None,
+            lesson_type: None,
+            cabinet: None,
+        })
+        .await?;
+    bot.send_message(msg.chat.id, "Введите название дисциплины:")
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .await?;
+    Ok(())
 }
 
-async fn get_schedule(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
-    let schedule = load_schedule()?;
-    let mut start = Local::now();
+async fn delete_lesson_handler(
+    bot: Bot,
+    msg: Message,
+    dialogue: Dialogue<State, InMemStorage<State>>,
+) -> HandlerResult {
+    dialogue
+        .update(State::DeleteLesson {
+            name: None,
+            time: None,
+            duration: None,
+            lesson_type: None,
+            cabinet: None,
+        })
+        .await?;
+    bot.send_message(msg.chat.id, "Введите название дисциплины:")
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .await?;
+    Ok(())
+}
+
+async fn get_schedule(bot: Bot, msg: Message, cmd: Command) -> HandlerResult {
+    let schedule = schedule::load()?;
+    let mut start = Local::now().to_utc();
     let mut end = start + Duration::days(1);
     match cmd {
         Command::Tomorrow => {
@@ -126,43 +267,43 @@ async fn get_schedule(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()
         }
         _ => {}
     }
+
     for day in 0..(end - start).num_days() {
         let curr = start + Duration::days(day);
         let mut message = format!(
             "<b>{}</b>\n\n",
             curr.format_localized("%d %B (%A)", Locale::ru_RU)
         );
-        let mut lessons: Vec<String> = Vec::new();
-        for lesson in schedule.iter() {
-            if lesson.date.date_naive() == curr.date_naive() {
-                if lesson.cabinet != "" {
-                    lessons.push(format!(
-                        "{}-{}\n<b>{}</b>\n{} ({})\n",
-                        lesson.date.format("%H:%M"),
-                        (lesson.date + Duration::minutes(lesson.duration)).format("%H:%M"),
-                        lesson.name,
-                        lesson.lesson_type,
-                        lesson.cabinet
-                    ))
-                } else {
-                    lessons.push(format!(
-                        "{}-{}\n<b>{}</b>\n{}\n",
-                        lesson.date.format("%H:%M"),
-                        (lesson.date + Duration::minutes(lesson.duration)).format("%H:%M"),
-                        lesson.name,
-                        lesson.lesson_type
-                    ))
-                }
-            }
-        }
-        if lessons.len() > 0 {
-            message.push_str(&lessons.join("------\n\n"));
-        } else {
+        let curr = curr.date_naive();
+        let lessons = schedule
+            .iter()
+            .filter(|lesson| lesson.date.date_naive() == curr)
+            .map(|lesson| {
+                format!(
+                    "{}-{}\n<b>{}</b>\n{} {}",
+                    lesson.date.format("%H:%M"),
+                    (lesson.date + Duration::minutes(lesson.duration)).format("%H:%M"),
+                    lesson.name,
+                    lesson.lesson_type,
+                    if lesson.cabinet.is_empty() {
+                        ""
+                    } else {
+                        &lesson.cabinet
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n------\n\n");
+
+        if lessons.is_empty() {
             message.push_str("Нет пар");
+        } else {
+            message.push_str(&lessons);
         }
         bot.send_message(msg.chat.id, message)
             .parse_mode(teloxide::types::ParseMode::Html)
             .await?;
     }
+
     Ok(())
 }
