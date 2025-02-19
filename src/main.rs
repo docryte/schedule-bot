@@ -68,8 +68,7 @@ async fn main() {
                 cabinet
             }]
             .endpoint(manage_lessons_handler),
-        )
-        .branch(dptree::endpoint(default));
+        );
 
     Dispatcher::builder(
         bot,
