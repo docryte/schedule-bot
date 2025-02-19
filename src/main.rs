@@ -96,6 +96,7 @@ async fn default(bot: Bot, msg: Message) -> HandlerResult {
 /add - добавить занятие в расписание \n
 /delete - удалить добавленное занятие",
     )
+    .parse_mode(teloxide::types::ParseMode::Html)
     .await?;
     Ok(())
 }
