@@ -37,8 +37,6 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    pretty_env_logger::init();
-
     let bot = Bot::from_env();
 
     let command_handler = teloxide::filter_command::<Command, _>()
